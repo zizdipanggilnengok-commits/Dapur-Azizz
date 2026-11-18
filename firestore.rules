@@ -1,0 +1,312 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global safety net: default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Helper Primitives ---
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isAdminEmail() {
+      return isVerified() && (
+        request.auth.token.email == 'zizdipanggilnengok@gmail.com' ||
+        request.auth.token.email == 'admin@dapuraziz.com'
+      );
+    }
+
+    function isAdmin() {
+      return isVerified() && (
+        request.auth.token.email == 'zizdipanggilnengok@gmail.com' ||
+        request.auth.token.email == 'admin@dapuraziz.com' ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    // --- Validation Blueprints ---
+    function isValidProfile(data, userId) {
+      return data.keys().hasAll([
+        'id', 'nama_lengkap', 'email', 'no_hp', 'alamat', 'role', 'created_at', 'updated_at'
+      ])
+      && data.keys().hasOnly([
+        'id', 'nama_lengkap', 'email', 'no_hp', 'alamat', 'role', 'created_at', 'updated_at'
+      ])
+      && data.id is string && data.id == userId && isValidId(data.id)
+      && data.nama_lengkap is string && data.nama_lengkap.size() >= 1 && data.nama_lengkap.size() <= 120
+      && data.email is string && data.email.size() >= 3 && data.email.size() <= 160
+      && data.no_hp is string && data.no_hp.size() <= 30
+      && data.alamat is string && data.alamat.size() <= 300
+      && data.role is string && data.role in ['admin', 'user']
+      && data.created_at is timestamp
+      && data.updated_at is timestamp;
+    }
+
+    function isValidAdminRole(data, userId) {
+      return data.keys().hasAll(['uid', 'email', 'created_at'])
+      && data.keys().hasOnly(['uid', 'email', 'created_at'])
+      && data.uid is string && data.uid == userId && isValidId(data.uid)
+      && data.email is string && data.email.size() >= 3 && data.email.size() <= 160
+      && data.created_at is timestamp;
+    }
+
+    function isValidProduct(data, productId) {
+      return data.keys().hasAll([
+        'id', 'nama_produk', 'kategori', 'harga', 'deskripsi', 'gambar_url', 'tersedia', 'created_at', 'updated_at'
+      ])
+      && data.keys().hasOnly([
+        'id', 'nama_produk', 'kategori', 'harga', 'deskripsi', 'gambar_url', 'tersedia', 'created_at', 'updated_at'
+      ])
+      && data.id is string && data.id == productId && isValidId(data.id)
+      && data.nama_produk is string && data.nama_produk.size() >= 1 && data.nama_produk.size() <= 120
+      && data.kategori is string && data.kategori in ['Makanan', 'Minuman']
+      && data.harga is number && data.harga >= 0 && data.harga <= 100000000
+      && data.deskripsi is string && data.deskripsi.size() <= 400
+      && data.gambar_url is string && data.gambar_url.size() <= 500
+      && data.tersedia is bool
+      && data.created_at is timestamp
+      && data.updated_at is timestamp;
+    }
+
+    function isValidOrder(data, orderId) {
+      return data.keys().hasAll([
+        'id', 'user_id', 'nama_pelanggan', 'no_hp', 'alamat_pengiriman',
+        'total_harga', 'jumlah_item', 'ringkasan_menu', 'status_pesanan',
+        'catatan', 'created_at', 'updated_at'
+      ])
+      && data.keys().hasOnly([
+        'id', 'user_id', 'nama_pelanggan', 'no_hp', 'alamat_pengiriman',
+        'total_harga', 'jumlah_item', 'ringkasan_menu', 'status_pesanan',
+        'catatan', 'created_at', 'updated_at'
+      ])
+      && data.id is string && data.id == orderId && isValidId(data.id)
+      && data.user_id is string && isValidId(data.user_id)
+      && data.nama_pelanggan is string && data.nama_pelanggan.size() >= 1 && data.nama_pelanggan.size() <= 120
+      && data.no_hp is string && data.no_hp.size() <= 30
+      && data.alamat_pengiriman is string && data.alamat_pengiriman.size() <= 300
+      && data.total_harga is number && data.total_harga > 0 && data.total_harga <= 1000000000
+      && data.jumlah_item is number && data.jumlah_item >= 1 && data.jumlah_item <= 500
+      && data.ringkasan_menu is string && data.ringkasan_menu.size() >= 1 && data.ringkasan_menu.size() <= 500
+      && data.status_pesanan is string && data.status_pesanan in ['Menunggu Konfirmasi', 'Dimasak', 'Selesai', 'Dibatalkan']
+      && data.catatan is string && data.catatan.size() <= 400
+      && data.created_at is timestamp
+      && data.updated_at is timestamp;
+    }
+
+    function isValidOrderItem(data, orderId, itemId) {
+      return data.keys().hasAll([
+        'id', 'order_id', 'user_id', 'product_id', 'nama_produk', 'harga_satuan', 'qty', 'subtotal'
+      ])
+      && data.keys().hasOnly([
+        'id', 'order_id', 'user_id', 'product_id', 'nama_produk', 'harga_satuan', 'qty', 'subtotal'
+      ])
+      && data.id is string && data.id == itemId && isValidId(data.id)
+      && data.order_id is string && data.order_id == orderId && isValidId(data.order_id)
+      && data.user_id is string && isValidId(data.user_id)
+      && data.product_id is string && isValidId(data.product_id)
+      && data.nama_produk is string && data.nama_produk.size() >= 1 && data.nama_produk.size() <= 120
+      && data.harga_satuan is number && data.harga_satuan >= 0 && data.harga_satuan <= 100000000
+      && data.qty is number && data.qty >= 1 && data.qty <= 100
+      && data.subtotal is number && data.subtotal >= 0 && data.subtotal <= 1000000000;
+    }
+
+    function isValidRating(data, ratingId) {
+      return data.keys().hasAll([
+        'id', 'product_id', 'user_id', 'nama_pengulas', 'rating', 'ulasan', 'created_at', 'updated_at'
+      ])
+      && data.keys().hasOnly([
+        'id', 'product_id', 'user_id', 'nama_pengulas', 'rating', 'ulasan', 'created_at', 'updated_at'
+      ])
+      && data.id is string && data.id == ratingId && isValidId(data.id)
+      && data.product_id is string && isValidId(data.product_id)
+      && data.user_id is string && isValidId(data.user_id)
+      && data.nama_pengulas is string && data.nama_pengulas.size() >= 1 && data.nama_pengulas.size() <= 120
+      && data.rating is number && data.rating >= 1 && data.rating <= 5
+      && data.ulasan is string && data.ulasan.size() <= 300
+      && data.created_at is timestamp
+      && data.updated_at is timestamp;
+    }
+
+    // --- Connection Probe ---
+    match /test/connection {
+      allow get: if true;
+    }
+
+    // --- Profiles Collection (PII Isolated) ---
+    match /profiles/{userId} {
+      allow get: if isValidId(userId) && isSignedIn() && (isOwner(userId) || isAdmin());
+      allow list: if isAdminEmail();
+
+      allow create: if isValidId(userId)
+        && isVerified()
+        && isOwner(userId)
+        && isValidProfile(incoming(), userId)
+        && incoming().created_at == request.time
+        && incoming().updated_at == request.time
+        && (
+          incoming().role == 'user' ||
+          (isAdmin() && incoming().role == 'admin')
+        );
+
+      allow update: if isValidId(userId)
+        && isVerified()
+        && isValidProfile(incoming(), userId)
+        && incoming().id == existing().id
+        && incoming().email == existing().email
+        && incoming().created_at == existing().created_at
+        && incoming().updated_at == request.time
+        && (
+          (isOwner(userId) && incoming().role == existing().role && incoming().diff(existing()).affectedKeys().hasOnly(['nama_lengkap', 'no_hp', 'alamat', 'updated_at'])) ||
+          (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['nama_lengkap', 'no_hp', 'alamat', 'role', 'updated_at']))
+        );
+
+      allow delete: if isValidId(userId) && isAdmin();
+    }
+
+    // --- Admins Collection ---
+    match /admins/{userId} {
+      allow get: if isValidId(userId) && isSignedIn() && (isOwner(userId) || isAdmin());
+      allow list: if isAdminEmail();
+      allow create: if isValidId(userId) && isAdmin() && isValidAdminRole(incoming(), userId) && incoming().created_at == request.time;
+      allow update: if isValidId(userId) && isAdmin() && isValidAdminRole(incoming(), userId) && incoming().created_at == existing().created_at;
+      allow delete: if isValidId(userId) && isAdmin();
+    }
+
+    // --- Products Catalog Collection ---
+    match /products/{productId} {
+      allow get: if isValidId(productId);
+      allow list: if true;
+
+      allow create: if isValidId(productId)
+        && isAdmin()
+        && isValidProduct(incoming(), productId)
+        && incoming().created_at == request.time
+        && incoming().updated_at == request.time;
+
+      allow update: if isValidId(productId)
+        && isAdmin()
+        && isValidProduct(incoming(), productId)
+        && incoming().id == existing().id
+        && incoming().created_at == existing().created_at
+        && incoming().updated_at == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'nama_produk', 'kategori', 'harga', 'deskripsi', 'gambar_url', 'tersedia', 'updated_at'
+        ]);
+
+      allow delete: if isValidId(productId) && isAdmin();
+    }
+
+    // --- Orders Collection ---
+    match /orders/{orderId} {
+      allow get: if isValidId(orderId) && isSignedIn() && (existing().user_id == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && (resource.data.user_id == request.auth.uid || isAdminEmail());
+
+      allow create: if isValidId(orderId)
+        && isVerified()
+        && isValidOrder(incoming(), orderId)
+        && incoming().user_id == request.auth.uid
+        && incoming().status_pesanan == 'Menunggu Konfirmasi'
+        && incoming().created_at == request.time
+        && incoming().updated_at == request.time;
+
+      allow update: if isValidId(orderId)
+        && isVerified()
+        && isValidOrder(incoming(), orderId)
+        && incoming().id == existing().id
+        && incoming().user_id == existing().user_id
+        && incoming().nama_pelanggan == existing().nama_pelanggan
+        && incoming().no_hp == existing().no_hp
+        && incoming().alamat_pengiriman == existing().alamat_pengiriman
+        && incoming().total_harga == existing().total_harga
+        && incoming().jumlah_item == existing().jumlah_item
+        && incoming().ringkasan_menu == existing().ringkasan_menu
+        && incoming().catatan == existing().catatan
+        && incoming().created_at == existing().created_at
+        && incoming().updated_at == request.time
+        && (
+          (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['status_pesanan', 'updated_at'])) ||
+          (existing().user_id == request.auth.uid
+            && existing().status_pesanan == 'Menunggu Konfirmasi'
+            && incoming().status_pesanan == 'Dibatalkan'
+            && incoming().diff(existing()).affectedKeys().hasOnly(['status_pesanan', 'updated_at']))
+        );
+
+      allow delete: if isValidId(orderId) && isAdmin();
+
+      // --- Order Items Subcollection ---
+      match /order_items/{itemId} {
+        allow get: if isValidId(orderId) && isValidId(itemId) && isSignedIn() && (
+          get(/databases/$(database)/documents/orders/$(orderId)).data.user_id == request.auth.uid || isAdmin()
+        );
+        allow list: if isValidId(orderId) && isSignedIn() && (
+          resource.data.user_id == request.auth.uid || isAdminEmail()
+        );
+
+        allow create: if isValidId(orderId)
+          && isValidId(itemId)
+          && isVerified()
+          && isValidOrderItem(incoming(), orderId, itemId)
+          && incoming().user_id == request.auth.uid
+          && getAfter(/databases/$(database)/documents/orders/$(orderId)).data.user_id == request.auth.uid;
+
+        allow update: if isValidId(orderId) && isValidId(itemId) && isAdmin() && isValidOrderItem(incoming(), orderId, itemId);
+        allow delete: if isValidId(orderId) && isValidId(itemId) && isAdmin();
+      }
+    }
+
+    // --- Ratings Collection ---
+    match /ratings/{ratingId} {
+      allow get: if isValidId(ratingId);
+      allow list: if true;
+
+      allow create: if isValidId(ratingId)
+        && isVerified()
+        && isValidRating(incoming(), ratingId)
+        && incoming().user_id == request.auth.uid
+        && ratingId == incoming().product_id + '__' + request.auth.uid
+        && incoming().created_at == request.time
+        && incoming().updated_at == request.time
+        && exists(/databases/$(database)/documents/products/$(incoming().product_id));
+
+      allow update: if isValidId(ratingId)
+        && isVerified()
+        && isValidRating(incoming(), ratingId)
+        && existing().user_id == request.auth.uid
+        && incoming().id == existing().id
+        && incoming().product_id == existing().product_id
+        && incoming().user_id == existing().user_id
+        && incoming().created_at == existing().created_at
+        && incoming().updated_at == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'nama_pengulas', 'rating', 'ulasan', 'updated_at'
+        ]);
+
+      allow delete: if isValidId(ratingId)
+        && isVerified()
+        && (existing().user_id == request.auth.uid || isAdmin());
+    }
+  }
+}
