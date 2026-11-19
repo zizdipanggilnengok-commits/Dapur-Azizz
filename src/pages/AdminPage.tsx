@@ -1,5 +1,6 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
+  AlertCircle,
   CheckCircle2,
   ChefHat,
   Clock,
@@ -15,19 +16,13 @@ import {
   X,
   XCircle,
 } from 'lucide-react';
-import {
-  collection,
-  deleteDoc,
-  doc,
-  getDocs,
-  onSnapshot,
-  serverTimestamp,
-  setDoc,
-  updateDoc,
-} from 'firebase/firestore';
 import { useMenu } from '../context/MenuContext.tsx';
-import { formatRupiah, IMAGE_PRESETS } from '../data/seedMenu.ts';
-import { db, handleFirestoreError, OperationType } from '../lib/firebase.ts';
+import {
+  formatRupiah,
+  IMAGE_PRESETS,
+  resolveProductImage,
+} from '../data/seedMenu.ts';
+import { supabase } from '../lib/supabase.ts';
 import type {
   MenuCategory,
   Order,
@@ -77,6 +72,7 @@ export function AdminPage() {
     products,
     isSeededInDb,
     seedInitialMenu,
+    refreshMenu,
     getProductRatingStats,
     openRatingModal,
   } = useMenu();
@@ -106,48 +102,77 @@ export function AdminPage() {
   const [tersedia, setTersedia] = useState(true);
   const [savingMenu, setSavingMenu] = useState(false);
   const [seeding, setSeeding] = useState(false);
+  const [adminError, setAdminError] = useState('');
 
-  // Subscribe to all orders
-  useEffect(() => {
-    const unsubscribe = onSnapshot(
-      collection(db, 'orders'),
-      (snapshot) => {
-        const list = snapshot.docs.map((d) => d.data() as Order);
-        list.sort((a, b) => {
-          const tA = a.created_at?.toMillis() ?? 0;
-          const tB = b.created_at?.toMillis() ?? 0;
-          return tB - tA;
-        });
-        setOrders(list);
-        setOrdersLoading(false);
-      },
-      (error) => {
-        handleFirestoreError(error, OperationType.LIST, 'orders');
-        setOrdersLoading(false);
-      },
-    );
+  const fetchOrders = useCallback(async () => {
+    const { data, error } = await supabase
+      .from('orders')
+      .select(
+        'id, user_id, nama_penerima, alamat_pengiriman, no_hp, total_harga, status_pesanan, catatan, created_at, order_items(id, order_id, product_id, nama_produk, jumlah, harga_satuan)',
+      )
+      .order('created_at', { ascending: false });
 
-    return () => unsubscribe();
+    if (error) {
+      console.error('Gagal memuat daftar pesanan:', error.message);
+      setOrdersLoading(false);
+      return;
+    }
+
+    const loadedOrders = (data ?? []) as Order[];
+    setOrders(loadedOrders);
+
+    const itemsByOrder: Record<string, OrderItem[]> = {};
+    for (const ord of loadedOrders) {
+      if (ord.order_items) {
+        itemsByOrder[ord.id] = ord.order_items;
+      }
+    }
+    setOrderItemsMap((prev) => ({ ...prev, ...itemsByOrder }));
+    setOrdersLoading(false);
   }, []);
 
-  // Subscribe to all registered profiles
-  useEffect(() => {
-    const unsubscribe = onSnapshot(
-      collection(db, 'profiles'),
-      (snapshot) => {
-        const list = snapshot.docs.map((d) => d.data() as Profile);
-        list.sort((a, b) => a.nama_lengkap.localeCompare(b.nama_lengkap));
-        setProfiles(list);
-        setUsersLoading(false);
-      },
-      (error) => {
-        handleFirestoreError(error, OperationType.LIST, 'profiles');
-        setUsersLoading(false);
-      },
-    );
+  const fetchProfiles = useCallback(async () => {
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('id, nama_lengkap, email, no_hp, alamat, role')
+      .order('nama_lengkap', { ascending: true });
 
-    return () => unsubscribe();
+    if (error) {
+      console.error('Gagal memuat daftar pengguna:', error.message);
+      setUsersLoading(false);
+      return;
+    }
+
+    setProfiles((data ?? []) as Profile[]);
+    setUsersLoading(false);
   }, []);
+
+  useEffect(() => {
+    void fetchOrders();
+    void fetchProfiles();
+
+    const channel = supabase
+      .channel('dapur-aziz-admin-updates')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'orders' },
+        () => {
+          void fetchOrders();
+        },
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'profiles' },
+        () => {
+          void fetchProfiles();
+        },
+      )
+      .subscribe();
+
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [fetchOrders, fetchProfiles]);
 
   const filteredOrders = useMemo(() => {
     if (orderFilter === 'Semua') return orders;
@@ -161,7 +186,7 @@ export function AdminPage() {
       (p) =>
         p.nama_lengkap.toLowerCase().includes(q) ||
         p.email.toLowerCase().includes(q) ||
-        p.no_hp.toLowerCase().includes(q),
+        (p.no_hp || '').toLowerCase().includes(q),
     );
   }, [profiles, userSearch]);
 
@@ -178,14 +203,21 @@ export function AdminPage() {
     newStatus: OrderStatus,
   ) => {
     setUpdatingOrderId(orderId);
-    const path = `orders/${orderId}`;
+    setAdminError('');
     try {
-      await updateDoc(doc(db, 'orders', orderId), {
-        status_pesanan: newStatus,
-        updated_at: serverTimestamp(),
-      });
+      const { error } = await supabase
+        .from('orders')
+        .update({
+          status_pesanan: newStatus,
+        })
+        .eq('id', orderId);
+
+      if (error) throw new Error(error.message);
+      await fetchOrders();
     } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, path);
+      setAdminError(
+        err instanceof Error ? err.message : 'Gagal memperbarui status pesanan.',
+      );
     } finally {
       setUpdatingOrderId(null);
     }
@@ -198,13 +230,15 @@ export function AdminPage() {
     }
     setExpandedOrderId(orderId);
     if (!orderItemsMap[orderId]) {
-      const path = `orders/${orderId}/order_items`;
-      try {
-        const snap = await getDocs(collection(db, 'orders', orderId, 'order_items'));
-        const items = snap.docs.map((d) => d.data() as OrderItem);
-        setOrderItemsMap((prev) => ({ ...prev, [orderId]: items }));
-      } catch (err) {
-        handleFirestoreError(err, OperationType.LIST, path);
+      const { data, error } = await supabase
+        .from('order_items')
+        .select('id, order_id, product_id, nama_produk, jumlah, harga_satuan')
+        .eq('order_id', orderId);
+      if (!error && data) {
+        setOrderItemsMap((prev) => ({
+          ...prev,
+          [orderId]: data as OrderItem[],
+        }));
       }
     }
   };
@@ -225,8 +259,8 @@ export function AdminPage() {
     setNamaProduk(product.nama_produk);
     setKategori(product.kategori);
     setHarga(String(product.harga));
-    setDeskripsi(product.deskripsi);
-    setGambarUrl(product.gambar_url);
+    setDeskripsi(product.deskripsi || '');
+    setGambarUrl(resolveProductImage(product) || '');
     setTersedia(product.tersedia);
     setMenuModalOpen(true);
   };
@@ -239,78 +273,85 @@ export function AdminPage() {
     }
 
     setSavingMenu(true);
+    setAdminError('');
     try {
+      const cleanedImage = gambarUrl.trim().slice(0, 500) || null;
       if (editingProduct) {
-        const path = `products/${editingProduct.id}`;
-        try {
-          await updateDoc(doc(db, 'products', editingProduct.id), {
+        const { error } = await supabase
+          .from('products')
+          .update({
             nama_produk: namaProduk.trim().slice(0, 120),
             kategori,
             harga: numericPrice,
             deskripsi: deskripsi.trim().slice(0, 400),
-            gambar_url: gambarUrl.trim().slice(0, 500),
+            gambar_url: cleanedImage,
             tersedia,
-            updated_at: serverTimestamp(),
-          });
-        } catch (err) {
-          handleFirestoreError(err, OperationType.UPDATE, path);
-        }
+          })
+          .eq('id', editingProduct.id);
+
+        if (error) throw new Error(error.message);
       } else {
-        const slug = namaProduk
-          .trim()
-          .toLowerCase()
-          .replace(/[^a-z0-9]+/g, '-')
-          .replace(/^-|-$/g, '')
-          .slice(0, 60);
-        const productId = `${slug || 'menu'}-${Date.now().toString(36)}`;
-        const path = `products/${productId}`;
-        try {
-          await setDoc(doc(db, 'products', productId), {
-            id: productId,
-            nama_produk: namaProduk.trim().slice(0, 120),
-            kategori,
-            harga: numericPrice,
-            deskripsi: deskripsi.trim().slice(0, 400),
-            gambar_url: gambarUrl.trim().slice(0, 500),
-            tersedia,
-            created_at: serverTimestamp(),
-            updated_at: serverTimestamp(),
-          });
-        } catch (err) {
-          handleFirestoreError(err, OperationType.CREATE, path);
-        }
+        const { error } = await supabase.from('products').insert({
+          nama_produk: namaProduk.trim().slice(0, 120),
+          kategori,
+          harga: numericPrice,
+          deskripsi: deskripsi.trim().slice(0, 400),
+          gambar_url: cleanedImage,
+          tersedia,
+        });
+
+        if (error) throw new Error(error.message);
       }
+      await refreshMenu();
       setMenuModalOpen(false);
+    } catch (err) {
+      setAdminError(
+        err instanceof Error ? err.message : 'Gagal menyimpan menu.',
+      );
     } finally {
       setSavingMenu(false);
     }
   };
 
   const handleToggleStock = async (product: Product) => {
-    const path = `products/${product.id}`;
-    try {
-      await updateDoc(doc(db, 'products', product.id), {
+    setAdminError('');
+    const { error } = await supabase
+      .from('products')
+      .update({
         tersedia: !product.tersedia,
-        updated_at: serverTimestamp(),
-      });
-    } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, path);
+      })
+      .eq('id', product.id);
+
+    if (error) {
+      setAdminError(error.message);
+    } else {
+      await refreshMenu();
     }
   };
 
   const handleDeleteProduct = async (product: Product) => {
-    const path = `products/${product.id}`;
-    try {
-      await deleteDoc(doc(db, 'products', product.id));
-    } catch (err) {
-      handleFirestoreError(err, OperationType.DELETE, path);
+    setAdminError('');
+    const { error } = await supabase
+      .from('products')
+      .delete()
+      .eq('id', product.id);
+
+    if (error) {
+      setAdminError(error.message);
+    } else {
+      await refreshMenu();
     }
   };
 
   const handleSeedMenu = async () => {
     setSeeding(true);
+    setAdminError('');
     try {
       await seedInitialMenu();
+    } catch (err) {
+      setAdminError(
+        err instanceof Error ? err.message : 'Gagal menyinkronkan menu awal.',
+      );
     } finally {
       setSeeding(false);
     }
@@ -338,6 +379,13 @@ export function AdminPage() {
           <span>Tambah Menu Baru</span>
         </button>
       </div>
+
+      {adminError && (
+        <div className="flex items-start gap-2.5 p-4 rounded-xl bg-[#FEF2F2] border border-[#FECACA] text-[#991B1B] text-xs">
+          <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+          <span>{adminError}</span>
+        </div>
+      )}
 
       {/* 4-column KPI Strip */}
       <section aria-label="Ringkasan Operasional" className="grid grid-cols-2 lg:grid-cols-4 gap-4">
@@ -427,7 +475,7 @@ export function AdminPage() {
           >
             <RefreshCw className={`w-3.5 h-3.5 ${seeding ? 'animate-spin' : ''}`} />
             <span>
-              {isSeededInDb ? 'Reset 9 Menu Bawaan' : 'Sinkronkan 9 Menu Bawaan'}
+              {isSeededInDb ? 'Lengkapi Menu Bawaan' : 'Sinkronkan Menu Bawaan'}
             </span>
           </button>
         )}
@@ -472,12 +520,20 @@ export function AdminPage() {
                 const st = statusStyle(order.status_pesanan);
                 const StatusIcon = st.icon;
                 const dateStr = order.created_at
-                  ? order.created_at.toDate().toLocaleString('id-ID', {
+                  ? new Date(order.created_at).toLocaleString('id-ID', {
                       dateStyle: 'medium',
                       timeStyle: 'short',
                     })
                   : 'Baru saja';
                 const isExpanded = expandedOrderId === order.id;
+                const itemsForSummary =
+                  orderItemsMap[order.id] ?? order.order_items;
+                const summaryText =
+                  itemsForSummary && itemsForSummary.length > 0
+                    ? itemsForSummary
+                        .map((item) => `${item.jumlah}x ${item.nama_produk}`)
+                        .join(', ')
+                    : `Pesanan atas nama ${order.nama_penerima}`;
 
                 return (
                   <article
@@ -492,11 +548,11 @@ export function AdminPage() {
                           <span>{dateStr}</span>
                           <span aria-hidden="true">·</span>
                           <span className="font-semibold text-[#1C1613]">
-                            {order.nama_pelanggan} ({order.no_hp})
+                            {order.nama_penerima} ({order.no_hp})
                           </span>
                         </div>
                         <p className="text-base font-bold text-[#1C1613]">
-                          {order.ringkasan_menu}
+                          {summaryText}
                         </p>
                         <p className="text-xs text-[#574941]">
                           Alamat: {order.alamat_pengiriman}
@@ -590,11 +646,11 @@ export function AdminPage() {
                                 className="py-2 flex items-center justify-between"
                               >
                                 <span>
-                                  <strong>{item.qty}x</strong> {item.nama_produk} (
+                                  <strong>{item.jumlah}x</strong> {item.nama_produk} (
                                   {formatRupiah(item.harga_satuan)})
                                 </span>
                                 <span className="tabular-nums font-bold">
-                                  {formatRupiah(item.subtotal)}
+                                  {formatRupiah(item.harga_satuan * item.jumlah)}
                                 </span>
                               </li>
                             ))}
@@ -628,14 +684,15 @@ export function AdminPage() {
               <tbody className="divide-y divide-[#F1EBE3] text-sm">
                 {products.map((product) => {
                   const ratingStats = getProductRatingStats(product.id);
+                  const thumbSrc = resolveProductImage(product);
                   return (
                     <tr key={product.id} className="hover:bg-[#FCFAF7]/70">
                       <td className="py-3.5 px-5">
                         <div className="flex items-center gap-3">
                           <div className="w-12 h-9 rounded-lg overflow-hidden bg-[#F5EFE8] shrink-0 flex items-center justify-center">
-                            {product.gambar_url ? (
+                            {thumbSrc ? (
                               <img
-                                src={product.gambar_url}
+                                src={thumbSrc}
                                 alt={product.nama_produk}
                                 referrerPolicy="no-referrer"
                                 className="w-full h-full object-cover"

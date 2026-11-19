@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Minus, Plus, Star, UtensilsCrossed } from 'lucide-react';
-import { formatRupiah } from '../data/seedMenu.ts';
+import { formatRupiah, resolveProductImage } from '../data/seedMenu.ts';
 import { useCart } from '../context/CartContext.tsx';
 import { useMenu } from '../context/MenuContext.tsx';
 import type { Product } from '../types.ts';
@@ -12,14 +12,15 @@ export function ProductCard({ product }: { product: Product }) {
 
   const qtyInCart = getQty(product.id);
   const { average, count } = getProductRatingStats(product.id);
+  const imageSrc = resolveProductImage(product);
 
   return (
     <article className="group bg-white border border-[#EAE3DA] rounded-2xl overflow-hidden flex flex-col transition-all duration-200 hover:-translate-y-0.5 hover:shadow-md">
       {/* 4:3 Culinary Image with Zero-Broken-Image Fallback */}
       <div className="relative aspect-4/3 bg-[#F6F0E8] overflow-hidden">
-        {product.gambar_url && !imgError ? (
+        {imageSrc && !imgError ? (
           <img
-            src={product.gambar_url}
+            src={imageSrc}
             alt={product.nama_produk}
             referrerPolicy="no-referrer"
             onError={() => setImgError(true)}
@@ -37,7 +38,7 @@ export function ProductCard({ product }: { product: Product }) {
 
       {/* Card Body */}
       <div className="p-5 flex-1 flex flex-col">
-        {/* Clean Unboxed Metadata (Zero-Pill Discipline) */}
+        {/* Clean Unboxed Metadata */}
         <div className="flex items-center justify-between gap-2 text-xs font-medium text-[#7B6B61] mb-1.5">
           <div className="flex items-center gap-2">
             <span>{product.kategori}</span>
@@ -78,7 +79,7 @@ export function ProductCard({ product }: { product: Product }) {
         </h3>
 
         <p className="text-sm text-[#6E5E55] leading-relaxed line-clamp-2 mb-4 flex-1">
-          {product.deskripsi}
+          {product.deskripsi || 'Hidangan spesial racikan Dapur Aziz.'}
         </p>
 
         {/* Price + Action Row */}

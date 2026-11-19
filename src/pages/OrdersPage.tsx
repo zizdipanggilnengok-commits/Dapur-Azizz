@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
   CheckCircle2,
@@ -10,20 +10,10 @@ import {
   Star,
   XCircle,
 } from 'lucide-react';
-import {
-  collection,
-  doc,
-  getDocs,
-  onSnapshot,
-  query,
-  serverTimestamp,
-  updateDoc,
-  where,
-} from 'firebase/firestore';
 import { useAuth } from '../context/AuthContext.tsx';
 import { useMenu } from '../context/MenuContext.tsx';
 import { formatRupiah } from '../data/seedMenu.ts';
-import { db, handleFirestoreError, OperationType } from '../lib/firebase.ts';
+import { supabase } from '../lib/supabase.ts';
 import type { Order, OrderItem, OrderStatus } from '../types.ts';
 
 function getStatusMeta(status: OrderStatus) {
@@ -68,6 +58,35 @@ export function OrdersPage() {
   const [orderItemsMap, setOrderItemsMap] = useState<Record<string, OrderItem[]>>({});
   const [cancellingId, setCancellingId] = useState<string | null>(null);
 
+  const fetchMyOrders = useCallback(async () => {
+    if (!user) return;
+    const { data, error } = await supabase
+      .from('orders')
+      .select(
+        'id, user_id, nama_penerima, alamat_pengiriman, no_hp, total_harga, status_pesanan, catatan, created_at, order_items(id, order_id, product_id, nama_produk, jumlah, harga_satuan)',
+      )
+      .eq('user_id', user.id)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      console.error('Gagal memuat pesanan:', error.message);
+      setLoading(false);
+      return;
+    }
+
+    const loadedOrders = (data ?? []) as Order[];
+    setOrders(loadedOrders);
+
+    const itemsByOrder: Record<string, OrderItem[]> = {};
+    for (const ord of loadedOrders) {
+      if (ord.order_items) {
+        itemsByOrder[ord.id] = ord.order_items;
+      }
+    }
+    setOrderItemsMap((prev) => ({ ...prev, ...itemsByOrder }));
+    setLoading(false);
+  }, [user]);
+
   useEffect(() => {
     if (authLoading) return;
     if (!user) {
@@ -76,27 +95,28 @@ export function OrdersPage() {
       return;
     }
 
-    const q = query(collection(db, 'orders'), where('user_id', '==', user.uid));
-    const unsubscribe = onSnapshot(
-      q,
-      (snapshot) => {
-        const list = snapshot.docs.map((d) => d.data() as Order);
-        list.sort((a, b) => {
-          const tA = a.created_at?.toMillis() ?? 0;
-          const tB = b.created_at?.toMillis() ?? 0;
-          return tB - tA;
-        });
-        setOrders(list);
-        setLoading(false);
-      },
-      (error) => {
-        handleFirestoreError(error, OperationType.LIST, 'orders');
-        setLoading(false);
-      },
-    );
+    void fetchMyOrders();
 
-    return () => unsubscribe();
-  }, [user, authLoading]);
+    const channel = supabase
+      .channel(`my-orders-${user.id}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'orders',
+          filter: `user_id=eq.${user.id}`,
+        },
+        () => {
+          void fetchMyOrders();
+        },
+      )
+      .subscribe();
+
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [user, authLoading, fetchMyOrders]);
 
   const toggleExpandOrder = async (orderId: string) => {
     if (expandedOrderId === orderId) {
@@ -105,31 +125,31 @@ export function OrdersPage() {
     }
     setExpandedOrderId(orderId);
     if (!orderItemsMap[orderId] && user) {
-      const path = `orders/${orderId}/order_items`;
-      try {
-        const q = query(
-          collection(db, 'orders', orderId, 'order_items'),
-          where('user_id', '==', user.uid),
-        );
-        const snap = await getDocs(q);
-        const items = snap.docs.map((d) => d.data() as OrderItem);
-        setOrderItemsMap((prev) => ({ ...prev, [orderId]: items }));
-      } catch (err) {
-        handleFirestoreError(err, OperationType.LIST, path);
+      const { data, error } = await supabase
+        .from('order_items')
+        .select('id, order_id, product_id, nama_produk, jumlah, harga_satuan')
+        .eq('order_id', orderId);
+      if (!error && data) {
+        setOrderItemsMap((prev) => ({
+          ...prev,
+          [orderId]: data as OrderItem[],
+        }));
       }
     }
   };
 
   const handleCancelOrder = async (orderId: string) => {
     setCancellingId(orderId);
-    const path = `orders/${orderId}`;
     try {
-      await updateDoc(doc(db, 'orders', orderId), {
-        status_pesanan: 'Dibatalkan',
-        updated_at: serverTimestamp(),
-      });
-    } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, path);
+      const { error } = await supabase
+        .from('orders')
+        .update({
+          status_pesanan: 'Dibatalkan',
+        })
+        .eq('id', orderId);
+      if (!error) {
+        await fetchMyOrders();
+      }
     } finally {
       setCancellingId(null);
     }
@@ -209,9 +229,15 @@ export function OrdersPage() {
             const meta = getStatusMeta(order.status_pesanan);
             const StatusIcon = meta.icon;
             const isExpanded = expandedOrderId === order.id;
-            const detailItems = orderItemsMap[order.id];
+            const detailItems = orderItemsMap[order.id] ?? order.order_items;
+            const summaryText =
+              detailItems && detailItems.length > 0
+                ? detailItems
+                    .map((item) => `${item.jumlah}x ${item.nama_produk}`)
+                    .join(', ')
+                : `Pesanan atas nama ${order.nama_penerima}`;
             const dateStr = order.created_at
-              ? order.created_at.toDate().toLocaleString('id-ID', {
+              ? new Date(order.created_at).toLocaleString('id-ID', {
                   dateStyle: 'medium',
                   timeStyle: 'short',
                 })
@@ -231,7 +257,7 @@ export function OrdersPage() {
                         <span>{dateStr}</span>
                       </div>
                       <p className="text-base font-bold text-[#1C1613]">
-                        {order.ringkasan_menu}
+                        {summaryText}
                       </p>
                     </div>
 
@@ -317,7 +343,7 @@ export function OrdersPage() {
                   <div className="bg-[#FCFAF7] border-t border-[#EAE3DA] px-5 sm:px-6 py-4 space-y-3">
                     <div className="text-xs text-[#574941] space-y-0.5">
                       <p>
-                        <strong>Penerima:</strong> {order.nama_pelanggan} ({order.no_hp})
+                        <strong>Penerima:</strong> {order.nama_penerima} ({order.no_hp})
                       </p>
                       <p>
                         <strong>Alamat:</strong> {order.alamat_pengiriman}
@@ -338,7 +364,7 @@ export function OrdersPage() {
                               className="py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs"
                             >
                               <span className="font-medium text-[#1C1613]">
-                                {item.qty}x {item.nama_produk}
+                                {item.jumlah}x {item.nama_produk}
                               </span>
                               <div className="flex items-center gap-3">
                                 {order.status_pesanan === 'Selesai' &&
@@ -355,7 +381,7 @@ export function OrdersPage() {
                                     </button>
                                   )}
                                 <span className="tabular-nums font-semibold text-[#1C1613]">
-                                  {formatRupiah(item.subtotal)}
+                                  {formatRupiah(item.harga_satuan * item.jumlah)}
                                 </span>
                               </div>
                             </li>

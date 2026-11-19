@@ -66,7 +66,7 @@ export function Navbar() {
 
   const displayName =
     profile?.nama_lengkap ||
-    user?.displayName ||
+    (user?.user_metadata?.nama_lengkap as string | undefined) ||
     user?.email?.split('@')[0] ||
     'Akun';
 

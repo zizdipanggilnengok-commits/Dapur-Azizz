@@ -1,30 +1,6 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
-import {
-  createUserWithEmailAndPassword,
-  onAuthStateChanged,
-  sendEmailVerification,
-  signInWithEmailAndPassword,
-  signInWithPopup,
-  signOut,
-  updateProfile,
-  type User,
-} from 'firebase/auth';
-import {
-  doc,
-  getDoc,
-  onSnapshot,
-  serverTimestamp,
-  setDoc,
-  updateDoc,
-} from 'firebase/firestore';
-import {
-  auth,
-  BOOTSTRAP_ADMIN_EMAILS,
-  db,
-  googleProvider,
-  handleFirestoreError,
-  OperationType,
-} from '../lib/firebase.ts';
+import type { User } from '@supabase/supabase-js';
+import { BOOTSTRAP_ADMIN_EMAILS, supabase } from '../lib/supabase.ts';
 import type { Profile, UserRole } from '../types.ts';
 
 interface RegisterPayload {
@@ -44,21 +20,23 @@ interface AuthContextValue {
   authModalTab: 'login' | 'register';
   openAuthModal: (tab?: 'login' | 'register') => void;
   closeAuthModal: () => void;
-  loginWithGoogle: () => Promise<void>;
-  loginWithCredentials: (identifier: string, password: string) => Promise<void>;
-  registerWithEmail: (payload: RegisterPayload) => Promise<{ needsVerification: boolean }>;
+  loginWithCredentials: (
+    identifier: string,
+    password: string,
+  ) => Promise<{ needsVerification?: boolean; resolvedEmail?: string }>;
+  registerWithEmail: (
+    payload: RegisterPayload,
+  ) => Promise<{ needsVerification: boolean }>;
   logout: () => Promise<void>;
   updateMyProfile: (data: {
     nama_lengkap: string;
     no_hp: string;
     alamat: string;
   }) => Promise<void>;
-  resendVerification: () => Promise<void>;
+  resendVerification: (email?: string) => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null);
-
-const PENDING_REG_KEY = 'dapur_aziz_pending_profile';
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
@@ -67,111 +45,183 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [authModalOpen, setAuthModalOpen] = useState(false);
   const [authModalTab, setAuthModalTab] = useState<'login' | 'register'>('login');
 
-  useEffect(() => {
-    let unsubscribeProfile: (() => void) | null = null;
+  const buildFallbackProfile = (authUser: User): Profile => {
+    const emailLower = (authUser.email || '').toLowerCase();
+    const isBootstrapAdmin = BOOTSTRAP_ADMIN_EMAILS.some(
+      (adminEmail) => adminEmail.toLowerCase() === emailLower,
+    );
+    const meta = (authUser.user_metadata || {}) as Record<string, string>;
+    return {
+      id: authUser.id,
+      nama_lengkap:
+        meta.nama_lengkap ||
+        meta.full_name ||
+        emailLower.split('@')[0] ||
+        'Pelanggan Dapur Aziz',
+      email: authUser.email || '',
+      no_hp: meta.no_hp || '',
+      alamat: meta.alamat || '',
+      role: isBootstrapAdmin ? 'admin' : 'user',
+    };
+  };
 
-    const unsubscribeAuth = onAuthStateChanged(auth, async (firebaseUser) => {
-      if (unsubscribeProfile) {
-        unsubscribeProfile();
-        unsubscribeProfile = null;
+  const loadOrCreateProfile = async (authUser: User) => {
+    const emailLower = (authUser.email || '').toLowerCase();
+    const isBootstrapAdmin = BOOTSTRAP_ADMIN_EMAILS.some(
+      (adminEmail) => adminEmail.toLowerCase() === emailLower,
+    );
+
+    const fetchProfileOnce = () =>
+      supabase
+        .from('profiles')
+        .select('id, nama_lengkap, email, no_hp, alamat, role')
+        .eq('id', authUser.id)
+        .maybeSingle();
+
+    try {
+      let { data, error } = await fetchProfileOnce();
+
+      if (
+        error &&
+        /failed to fetch|networkerror|load failed/i.test(error.message)
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 400));
+        const retryRes = await fetchProfileOnce();
+        data = retryRes.data;
+        error = retryRes.error;
       }
 
-      setUser(firebaseUser);
+      if (error) {
+        console.warn('Profil dimuat menggunakan fallback lokal:', error.message);
+        setProfile(buildFallbackProfile(authUser));
+        return;
+      }
 
-      if (!firebaseUser) {
+      const meta = (authUser.user_metadata || {}) as Record<string, string>;
+
+      if (data) {
+        const loadedProfile = data as Profile;
+        const needsMetaSync =
+          (!loadedProfile.no_hp && Boolean(meta.no_hp)) ||
+          (!loadedProfile.alamat && Boolean(meta.alamat)) ||
+          (!loadedProfile.nama_lengkap && Boolean(meta.nama_lengkap));
+
+        if (needsMetaSync) {
+          const { data: synced } = await supabase
+            .from('profiles')
+            .update({
+              nama_lengkap: (
+                loadedProfile.nama_lengkap ||
+                meta.nama_lengkap ||
+                emailLower.split('@')[0] ||
+                'Pelanggan Dapur Aziz'
+              ).slice(0, 120),
+              no_hp: (loadedProfile.no_hp || meta.no_hp || '').slice(0, 30),
+              alamat: (loadedProfile.alamat || meta.alamat || '').slice(0, 300),
+            })
+            .eq('id', authUser.id)
+            .select('id, nama_lengkap, email, no_hp, alamat, role')
+            .maybeSingle();
+
+          setProfile((synced as Profile) || loadedProfile);
+          return;
+        }
+
+        setProfile(loadedProfile);
+        return;
+      }
+      const role: UserRole = isBootstrapAdmin ? 'admin' : 'user';
+      const newProfile = {
+        id: authUser.id,
+        nama_lengkap: (
+          meta.nama_lengkap ||
+          emailLower.split('@')[0] ||
+          'Pelanggan Dapur Aziz'
+        ).slice(0, 120),
+        email: (authUser.email || '').slice(0, 160),
+        no_hp: (meta.no_hp || '').slice(0, 30),
+        alamat: (meta.alamat || '').slice(0, 300),
+        role,
+      };
+
+      const { data: inserted, error: insertError } = await supabase
+        .from('profiles')
+        .upsert(newProfile, { onConflict: 'id' })
+        .select('id, nama_lengkap, email, no_hp, alamat, role')
+        .single();
+
+      if (insertError) {
+        console.warn(
+          'Profil awal menggunakan fallback lokal:',
+          insertError.message,
+        );
+        setProfile(buildFallbackProfile(authUser));
+        return;
+      }
+
+      setProfile(inserted as Profile);
+    } catch (err) {
+      console.warn(
+        'Koneksi profil tertunda, menggunakan profil sesi:',
+        err instanceof Error ? err.message : String(err),
+      );
+      setProfile(buildFallbackProfile(authUser));
+    }
+  };
+
+  useEffect(() => {
+    let mounted = true;
+    let activeLoadKey: string | null = null;
+
+    const syncSessionUser = (sessionUser: User | null) => {
+      if (!mounted) return;
+      setUser(sessionUser);
+      if (!sessionUser) {
+        activeLoadKey = null;
         setProfile(null);
         setLoading(false);
         return;
       }
 
-      const emailLower = (firebaseUser.email || '').toLowerCase();
-      const isBootstrapAdmin = BOOTSTRAP_ADMIN_EMAILS.some(
-        (adminEmail) => adminEmail.toLowerCase() === emailLower,
-      );
+      const loadKey = sessionUser.id;
+      if (activeLoadKey === loadKey) return;
+      activeLoadKey = loadKey;
 
-      if (!firebaseUser.emailVerified) {
-        setProfile({
-          id: firebaseUser.uid,
-          nama_lengkap:
-            firebaseUser.displayName || emailLower.split('@')[0] || 'Pelanggan',
-          email: firebaseUser.email || '',
-          no_hp: '',
-          alamat: '',
-          role: isBootstrapAdmin ? 'admin' : 'user',
-        });
-        setLoading(false);
-        return;
-      }
+      void loadOrCreateProfile(sessionUser).finally(() => {
+        if (mounted) setLoading(false);
+      });
+    };
 
-      const profilePath = `profiles/${firebaseUser.uid}`;
-      const profileRef = doc(db, 'profiles', firebaseUser.uid);
-
-      try {
-        const snap = await getDoc(profileRef);
-        if (!snap.exists()) {
-          let pending: Partial<RegisterPayload> = {};
-          try {
-            const raw = sessionStorage.getItem(PENDING_REG_KEY);
-            if (raw) {
-              pending = JSON.parse(raw) as Partial<RegisterPayload>;
-              sessionStorage.removeItem(PENDING_REG_KEY);
-            }
-          } catch {
-            // ignore storage errors
-          }
-
-          let role: UserRole = isBootstrapAdmin ? 'admin' : 'user';
-          if (!isBootstrapAdmin) {
-            try {
-              const adminSnap = await getDoc(doc(db, 'admins', firebaseUser.uid));
-              if (adminSnap.exists()) {
-                role = 'admin';
-              }
-            } catch {
-              // ignore non-admin check failure
-            }
-          }
-
-          const newProfileData = {
-            id: firebaseUser.uid,
-            nama_lengkap: (
-              pending.nama_lengkap ||
-              firebaseUser.displayName ||
-              emailLower.split('@')[0] ||
-              'Pelanggan Dapur Aziz'
-            ).slice(0, 120),
-            email: (firebaseUser.email || '').slice(0, 160),
-            no_hp: (pending.no_hp || '').slice(0, 30),
-            alamat: (pending.alamat || '').slice(0, 300),
-            role,
-            created_at: serverTimestamp(),
-            updated_at: serverTimestamp(),
-          };
-
-          await setDoc(profileRef, newProfileData);
+    supabase.auth
+      .getSession()
+      .then(({ data }) => {
+        syncSessionUser(data.session?.user ?? null);
+      })
+      .catch(() => {
+        if (mounted) {
+          setUser(null);
+          setProfile(null);
+          setLoading(false);
         }
-      } catch (err) {
-        handleFirestoreError(err, OperationType.WRITE, profilePath);
-      }
+      });
 
-      unsubscribeProfile = onSnapshot(
-        profileRef,
-        (docSnap) => {
-          if (docSnap.exists()) {
-            setProfile(docSnap.data() as Profile);
-          }
-          setLoading(false);
-        },
-        (err) => {
-          handleFirestoreError(err, OperationType.GET, profilePath);
-          setLoading(false);
-        },
-      );
-    });
+    const { data: listener } = supabase.auth.onAuthStateChange(
+      (_event, session) => {
+        if (!mounted) return;
+        const sessionUser = session?.user ?? null;
+        if (!sessionUser) {
+          syncSessionUser(null);
+          return;
+        }
+        setTimeout(() => {
+          syncSessionUser(sessionUser);
+        }, 0);
+      },
+    );
 
     return () => {
-      unsubscribeAuth();
-      if (unsubscribeProfile) unsubscribeProfile();
+      mounted = false;
+      listener.subscription.unsubscribe();
     };
   }, []);
 
@@ -184,65 +234,122 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setAuthModalOpen(false);
   };
 
-  const loginWithGoogle = async () => {
-    await signInWithPopup(auth, googleProvider);
-    setAuthModalOpen(false);
-  };
-
   const loginWithCredentials = async (identifier: string, password: string) => {
     const trimmed = identifier.trim();
-    const email =
-      trimmed.toLowerCase() === 'aziz'
-        ? 'admin@dapuraziz.com'
-        : trimmed.toLowerCase();
+    const isUsernameLogin = !trimmed.includes('@');
+    let email = trimmed.toLowerCase();
 
-    try {
-      await signInWithEmailAndPassword(auth, email, password);
-      setAuthModalOpen(false);
-    } catch (error: unknown) {
-      const code =
-        typeof error === 'object' && error !== null && 'code' in error
-          ? String((error as { code: string }).code)
-          : '';
+    if (isUsernameLogin) {
+      const escapedUsername = trimmed.replace(/[%_\\]/g, '\\$&');
+      const { data: matchedProfile, error: lookupError } = await supabase
+        .from('profiles')
+        .select('email')
+        .ilike('nama_lengkap', escapedUsername)
+        .limit(1)
+        .maybeSingle();
 
-      if (
-        email === 'admin@dapuraziz.com' &&
-        password === 'Aziz1' &&
-        (code === 'auth/user-not-found' || code === 'auth/invalid-credential')
-      ) {
-        const cred = await createUserWithEmailAndPassword(auth, email, password);
-        await updateProfile(cred.user, { displayName: 'Aziz' });
-        await sendEmailVerification(cred.user);
-        setAuthModalOpen(false);
-        return;
+      if (lookupError) {
+        throw new Error(`Gagal mencari username: ${lookupError.message}`);
       }
-      throw error;
+
+      if (!matchedProfile?.email) {
+        throw new Error(
+          `Username "${trimmed}" tidak ditemukan. Periksa kembali nama lengkap Anda atau masuk menggunakan email.`,
+        );
+      }
+
+      email = matchedProfile.email.trim().toLowerCase();
     }
+
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email,
+      password,
+    });
+
+    if (!error && data.user) {
+      setAuthModalOpen(false);
+      return { resolvedEmail: email };
+    }
+
+    const msg = error?.message || '';
+    if (msg.toLowerCase().includes('invalid login credentials')) {
+      throw new Error(
+        isUsernameLogin
+          ? `Kata sandi untuk username "${trimmed}" salah.`
+          : 'Email atau kata sandi tidak cocok.',
+      );
+    }
+
+    if (msg.toLowerCase().includes('email not confirmed')) {
+      throw new Error(
+        `Email "${email}" belum dikonfirmasi. Cek kotak masuk email Anda (atau nonaktifkan "Confirm email" di pengaturan Authentication Supabase).`,
+      );
+    }
+
+    throw error || new Error('Gagal masuk ke akun.');
   };
 
   const registerWithEmail = async (payload: RegisterPayload) => {
-    sessionStorage.setItem(
-      PENDING_REG_KEY,
-      JSON.stringify({
-        nama_lengkap: payload.nama_lengkap.trim(),
-        no_hp: payload.no_hp.trim(),
-        alamat: payload.alamat.trim(),
-      }),
-    );
+    const cleanEmail = payload.email.trim();
+    const cleanNama = payload.nama_lengkap.trim().slice(0, 120);
+    const cleanNoHp = payload.no_hp.trim().slice(0, 30);
+    const cleanAlamat = payload.alamat.trim().slice(0, 300);
 
-    const cred = await createUserWithEmailAndPassword(
-      auth,
-      payload.email.trim(),
-      payload.password,
-    );
-
-    await updateProfile(cred.user, {
-      displayName: payload.nama_lengkap.trim(),
+    const { data, error } = await supabase.auth.signUp({
+      email: cleanEmail,
+      password: payload.password,
+      options: {
+        data: {
+          nama_lengkap: cleanNama,
+          no_hp: cleanNoHp,
+          alamat: cleanAlamat,
+        },
+      },
     });
 
-    if (!cred.user.emailVerified) {
-      await sendEmailVerification(cred.user);
-      setAuthModalOpen(false);
+    if (error) {
+      throw error;
+    }
+
+    if (data.user) {
+      const emailLower = (data.user.email || cleanEmail).toLowerCase();
+      const isBootstrapAdmin = BOOTSTRAP_ADMIN_EMAILS.some(
+        (adminEmail) => adminEmail.toLowerCase() === emailLower,
+      );
+      const role: UserRole = isBootstrapAdmin ? 'admin' : 'user';
+
+      const { data: upsertedProfile, error: upsertError } = await supabase
+        .from('profiles')
+        .upsert(
+          {
+            id: data.user.id,
+            nama_lengkap: cleanNama || emailLower.split('@')[0] || 'Pelanggan Dapur Aziz',
+            email: (data.user.email || cleanEmail).slice(0, 160),
+            no_hp: cleanNoHp,
+            alamat: cleanAlamat,
+            role,
+          },
+          { onConflict: 'id' },
+        )
+        .select('id, nama_lengkap, email, no_hp, alamat, role')
+        .maybeSingle();
+
+      if (upsertError) {
+        if (data.session) {
+          throw new Error(
+            `Akun dibuat, namun gagal menyimpan profil: ${upsertError.message}`,
+          );
+        }
+        console.warn(
+          'Profil akan disinkronkan setelah konfirmasi email:',
+          upsertError.message,
+        );
+      } else if (upsertedProfile) {
+        setProfile(upsertedProfile as Profile);
+      }
+    }
+
+    if (!data.session) {
       return { needsVerification: true };
     }
 
@@ -251,7 +358,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   const logout = async () => {
-    await signOut(auth);
+    await supabase.auth.signOut();
+    setUser(null);
+    setProfile(null);
   };
 
   const updateMyProfile = async (data: {
@@ -260,28 +369,37 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     alamat: string;
   }) => {
     if (!user) return;
-    const path = `profiles/${user.uid}`;
-    try {
-      await updateDoc(doc(db, 'profiles', user.uid), {
+    const { data: updated, error } = await supabase
+      .from('profiles')
+      .update({
         nama_lengkap: data.nama_lengkap.trim().slice(0, 120),
         no_hp: data.no_hp.trim().slice(0, 30),
         alamat: data.alamat.trim().slice(0, 300),
-        updated_at: serverTimestamp(),
-      });
-    } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, path);
+      })
+      .eq('id', user.id)
+      .select('id, nama_lengkap, email, no_hp, alamat, role')
+      .single();
+
+    if (error) {
+      throw new Error(`Gagal memperbarui profil: ${error.message}`);
+    }
+    if (updated) {
+      setProfile(updated as Profile);
     }
   };
 
-  const resendVerification = async () => {
-    if (auth.currentUser && !auth.currentUser.emailVerified) {
-      await sendEmailVerification(auth.currentUser);
-    }
+  const resendVerification = async (email?: string) => {
+    const targetEmail = email || user?.email;
+    if (!targetEmail) return;
+    const { error } = await supabase.auth.resend({
+      type: 'signup',
+      email: targetEmail,
+    });
+    if (error) throw error;
   };
 
   const isAdmin = Boolean(
     user &&
-      user.emailVerified &&
       (profile?.role === 'admin' ||
         BOOTSTRAP_ADMIN_EMAILS.some(
           (email) => email.toLowerCase() === (user.email || '').toLowerCase(),
@@ -299,7 +417,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         authModalTab,
         openAuthModal,
         closeAuthModal,
-        loginWithGoogle,
         loginWithCredentials,
         registerWithEmail,
         logout,

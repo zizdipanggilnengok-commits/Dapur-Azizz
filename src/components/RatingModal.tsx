@@ -10,7 +10,7 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext.tsx';
 import { useMenu } from '../context/MenuContext.tsx';
-import { formatRupiah } from '../data/seedMenu.ts';
+import { formatRupiah, resolveProductImage } from '../data/seedMenu.ts';
 
 export function RatingModal() {
   const { user, isAdmin, openAuthModal } = useAuth();
@@ -20,7 +20,6 @@ export function RatingModal() {
     getProductRatingStats,
     submitRating,
     deleteRating,
-    isSeededInDb,
   } = useMenu();
 
   const [selectedStars, setSelectedStars] = useState(5);
@@ -36,7 +35,7 @@ export function RatingModal() {
     : { average: 0, count: 0, items: [] };
 
   const myExistingRating = user
-    ? stats.items.find((r) => r.user_id === user.uid)
+    ? stats.items.find((r) => r.user_id === user.id)
     : undefined;
 
   useEffect(() => {
@@ -56,6 +55,7 @@ export function RatingModal() {
   if (!ratingModalProduct) return null;
 
   const activeStars = hoverStars || selectedStars;
+  const thumbnailUrl = resolveProductImage(ratingModalProduct);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -65,13 +65,6 @@ export function RatingModal() {
     if (!user) {
       closeRatingModal();
       openAuthModal('login');
-      return;
-    }
-
-    if (!isSeededInDb) {
-      setError(
-        'Katalog menu sedang menunggu sinkronisasi awal oleh Admin sebelum ulasan dapat disimpan.',
-      );
       return;
     }
 
@@ -120,9 +113,9 @@ export function RatingModal() {
         <div className="px-6 py-4 border-b border-[#F1EBE3] flex items-center justify-between gap-4">
           <div className="flex items-center gap-3 min-w-0">
             <div className="w-12 h-9 rounded-lg overflow-hidden bg-[#F5EFE8] shrink-0 flex items-center justify-center">
-              {ratingModalProduct.gambar_url ? (
+              {thumbnailUrl ? (
                 <img
-                  src={ratingModalProduct.gambar_url}
+                  src={thumbnailUrl}
                   alt={ratingModalProduct.nama_produk}
                   referrerPolicy="no-referrer"
                   className="w-full h-full object-cover"
@@ -273,10 +266,11 @@ export function RatingModal() {
               <ul className="divide-y divide-[#F1EBE3]">
                 {stats.items.map((item) => {
                   const canDelete = Boolean(
-                    user && (user.uid === item.user_id || isAdmin),
+                    user && (user.id === item.user_id || isAdmin),
                   );
-                  const dateLabel = item.updated_at
-                    ? item.updated_at.toDate().toLocaleDateString('id-ID', {
+                  const rawDate = item.updated_at || item.created_at;
+                  const dateLabel = rawDate
+                    ? new Date(rawDate).toLocaleDateString('id-ID', {
                         day: 'numeric',
                         month: 'short',
                         year: 'numeric',

@@ -1,5 +1,3 @@
-import type { Timestamp } from 'firebase/firestore';
-
 export type UserRole = 'admin' | 'user';
 export type MenuCategory = 'Makanan' | 'Minuman';
 export type OrderStatus =
@@ -15,8 +13,7 @@ export interface Profile {
   no_hp: string;
   alamat: string;
   role: UserRole;
-  created_at?: Timestamp | null;
-  updated_at?: Timestamp | null;
+  created_at?: string | null;
 }
 
 export interface Product {
@@ -25,10 +22,9 @@ export interface Product {
   kategori: MenuCategory;
   harga: number;
   deskripsi: string;
-  gambar_url: string;
+  gambar_url: string | null;
   tersedia: boolean;
-  created_at?: Timestamp | null;
-  updated_at?: Timestamp | null;
+  created_at?: string | null;
 }
 
 export interface CartItem {
@@ -36,30 +32,26 @@ export interface CartItem {
   qty: number;
 }
 
-export interface Order {
-  id: string;
-  user_id: string;
-  nama_pelanggan: string;
-  no_hp: string;
-  alamat_pengiriman: string;
-  total_harga: number;
-  jumlah_item: number;
-  ringkasan_menu: string;
-  status_pesanan: OrderStatus;
-  catatan: string;
-  created_at?: Timestamp | null;
-  updated_at?: Timestamp | null;
-}
-
 export interface OrderItem {
   id: string;
   order_id: string;
-  user_id: string;
-  product_id: string;
+  product_id: string | null;
   nama_produk: string;
+  jumlah: number;
   harga_satuan: number;
-  qty: number;
-  subtotal: number;
+}
+
+export interface Order {
+  id: string;
+  user_id: string;
+  nama_penerima: string;
+  alamat_pengiriman: string;
+  no_hp: string;
+  total_harga: number;
+  status_pesanan: OrderStatus;
+  catatan: string | null;
+  created_at?: string | null;
+  order_items?: OrderItem[];
 }
 
 export interface Rating {
@@ -69,6 +61,6 @@ export interface Rating {
   nama_pengulas: string;
   rating: number;
   ulasan: string;
-  created_at?: Timestamp | null;
-  updated_at?: Timestamp | null;
+  created_at?: string | null;
+  updated_at?: string | null;
 }

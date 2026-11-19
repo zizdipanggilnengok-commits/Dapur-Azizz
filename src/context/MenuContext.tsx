@@ -1,18 +1,13 @@
-import React, { createContext, useContext, useEffect, useRef, useState } from 'react';
-import {
-  collection,
-  deleteDoc,
-  doc,
-  onSnapshot,
-  orderBy,
-  query,
-  serverTimestamp,
-  setDoc,
-  updateDoc,
-  writeBatch,
-} from 'firebase/firestore';
+import React, {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+} from 'react';
 import { SEED_MENU_ITEMS } from '../data/seedMenu.ts';
-import { db, handleFirestoreError, OperationType } from '../lib/firebase.ts';
+import { supabase } from '../lib/supabase.ts';
 import type { Product, Rating } from '../types.ts';
 import { useAuth } from './AuthContext.tsx';
 
@@ -38,6 +33,7 @@ interface MenuContextValue {
   ) => Promise<void>;
   deleteRating: (ratingId: string) => Promise<void>;
   seedInitialMenu: () => Promise<void>;
+  refreshMenu: () => Promise<void>;
 }
 
 const MenuContext = createContext<MenuContextValue | null>(null);
@@ -52,84 +48,120 @@ export function MenuProvider({ children }: { children: React.ReactNode }) {
   );
   const autoSeededRef = useRef(false);
 
-  useEffect(() => {
-    const q = query(collection(db, 'products'), orderBy('kategori', 'asc'));
-    const unsubscribe = onSnapshot(
-      q,
-      (snapshot) => {
-        const list = snapshot.docs.map((d) => d.data() as Product);
-        setDbProducts(list);
-        setLoading(false);
-      },
-      (error) => {
-        handleFirestoreError(error, OperationType.LIST, 'products');
-        setLoading(false);
-      },
-    );
+  const fetchProducts = useCallback(async () => {
+    const query = () =>
+      supabase
+        .from('products')
+        .select('id, nama_produk, kategori, harga, deskripsi, gambar_url, tersedia, created_at')
+        .order('kategori', { ascending: true })
+        .order('nama_produk', { ascending: true });
 
-    return () => unsubscribe();
-  }, []);
-
-  useEffect(() => {
-    const unsubscribe = onSnapshot(
-      collection(db, 'ratings'),
-      (snapshot) => {
-        const list = snapshot.docs.map((d) => d.data() as Rating);
-        list.sort((a, b) => {
-          const tA = a.updated_at?.toMillis() ?? a.created_at?.toMillis() ?? 0;
-          const tB = b.updated_at?.toMillis() ?? b.created_at?.toMillis() ?? 0;
-          return tB - tA;
-        });
-        setRatings(list);
-      },
-      (error) => {
-        handleFirestoreError(error, OperationType.LIST, 'ratings');
-      },
-    );
-
-    return () => unsubscribe();
-  }, []);
-
-  const REMOVED_PRODUCT_IDS = ['es-kukubima', 'es-extrajoss'];
-
-  const seedInitialMenu = async () => {
-    const batch = writeBatch(db);
-    for (const item of SEED_MENU_ITEMS) {
-      const ref = doc(db, 'products', item.id);
-      batch.set(ref, {
-        ...item,
-        created_at: serverTimestamp(),
-        updated_at: serverTimestamp(),
-      });
+    let { data, error } = await query();
+    if (error && /failed to fetch|networkerror|load failed/i.test(error.message)) {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      const retry = await query();
+      data = retry.data;
+      error = retry.error;
     }
-    for (const removedId of REMOVED_PRODUCT_IDS) {
-      batch.delete(doc(db, 'products', removedId));
-    }
-    try {
-      await batch.commit();
-    } catch (error) {
-      handleFirestoreError(error, OperationType.WRITE, 'products');
-    }
-  };
 
-  useEffect(() => {
-    if (!loading && isAdmin && dbProducts.length === 0 && !autoSeededRef.current) {
-      autoSeededRef.current = true;
-      void seedInitialMenu();
+    if (error) {
+      console.warn('Gagal memuat menu Supabase:', error.message);
+      setLoading(false);
       return;
     }
 
-    if (!loading && isAdmin && dbProducts.length > 0) {
-      const stale = dbProducts.filter((p) => REMOVED_PRODUCT_IDS.includes(p.id));
-      if (stale.length > 0) {
-        const batch = writeBatch(db);
-        stale.forEach((item) => batch.delete(doc(db, 'products', item.id)));
-        void batch.commit().catch((error) => {
-          handleFirestoreError(error, OperationType.DELETE, 'products');
-        });
+    setDbProducts((data ?? []) as Product[]);
+    setLoading(false);
+  }, []);
+
+  const fetchRatings = useCallback(async () => {
+    const { data, error } = await supabase
+      .from('ratings')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      console.warn('Gagal memuat rating Supabase:', error.message);
+      return;
+    }
+
+    setRatings((data ?? []) as Rating[]);
+  }, []);
+
+  useEffect(() => {
+    void fetchProducts();
+    void fetchRatings();
+
+    const channel = supabase
+      .channel('dapur-aziz-public-updates')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'products' },
+        () => {
+          void fetchProducts();
+        },
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'ratings' },
+        () => {
+          void fetchRatings();
+        },
+      )
+      .subscribe();
+
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [fetchProducts, fetchRatings]);
+
+  const seedInitialMenu = async () => {
+    const { data: existingRows, error: fetchError } = await supabase
+      .from('products')
+      .select('nama_produk');
+
+    if (fetchError) {
+      throw new Error(`Gagal membaca katalog menu: ${fetchError.message}`);
+    }
+
+    const existingNames = new Set(
+      (existingRows ?? []).map((row: { nama_produk: string }) =>
+        row.nama_produk.trim().toLowerCase(),
+      ),
+    );
+
+    const missingItems = SEED_MENU_ITEMS.filter(
+      (item) => !existingNames.has(item.nama_produk.trim().toLowerCase()),
+    ).map((item) => ({
+      nama_produk: item.nama_produk,
+      kategori: item.kategori,
+      harga: item.harga,
+      deskripsi: item.deskripsi,
+      gambar_url: item.gambar_url,
+      tersedia: item.tersedia,
+    }));
+
+    if (missingItems.length > 0) {
+      const { error } = await supabase.from('products').insert(missingItems);
+      if (error) {
+        throw new Error(`Gagal menambahkan menu awal: ${error.message}`);
       }
     }
-  }, [loading, isAdmin, dbProducts]);
+
+    await fetchProducts();
+  };
+
+  useEffect(() => {
+    if (
+      !loading &&
+      isAdmin &&
+      dbProducts.length === 0 &&
+      !autoSeededRef.current
+    ) {
+      autoSeededRef.current = true;
+      void seedInitialMenu().catch((err) => console.error(err));
+    }
+  }, [loading, isAdmin, dbProducts.length]);
 
   const getProductRatingStats = (productId: string): ProductRatingStats => {
     const items = ratings.filter((r) => r.product_id === productId);
@@ -149,56 +181,46 @@ export function MenuProvider({ children }: { children: React.ReactNode }) {
     stars: number,
     ulasan: string,
   ) => {
-    if (!user) throw new Error('Silakan masuk terlebih dahulu untuk memberi rating.');
-    if (!user.emailVerified) {
-      throw new Error(
-        'Verifikasi email Anda terlebih dahulu sebelum mengirim rating.',
-      );
+    if (!user) {
+      throw new Error('Silakan masuk terlebih dahulu untuk memberi rating.');
     }
+
     const clampedStars = Math.min(5, Math.max(1, Math.round(stars)));
-    const ratingId = `${productId}__${user.uid}`;
-    const path = `ratings/${ratingId}`;
-    const ref = doc(db, 'ratings', ratingId);
-    const existing = ratings.find((r) => r.id === ratingId);
     const reviewerName = (
       profile?.nama_lengkap ||
-      user.displayName ||
       user.email?.split('@')[0] ||
       'Pelanggan Dapur Aziz'
     ).slice(0, 120);
 
-    try {
-      if (existing) {
-        await updateDoc(ref, {
-          nama_pengulas: reviewerName,
-          rating: clampedStars,
-          ulasan: ulasan.trim().slice(0, 300),
-          updated_at: serverTimestamp(),
-        });
-      } else {
-        await setDoc(ref, {
-          id: ratingId,
-          product_id: productId,
-          user_id: user.uid,
-          nama_pengulas: reviewerName,
-          rating: clampedStars,
-          ulasan: ulasan.trim().slice(0, 300),
-          created_at: serverTimestamp(),
-          updated_at: serverTimestamp(),
-        });
-      }
-    } catch (error) {
-      handleFirestoreError(error, OperationType.WRITE, path);
+    const { error } = await supabase.from('ratings').upsert(
+      {
+        product_id: productId,
+        user_id: user.id,
+        nama_pengulas: reviewerName,
+        rating: clampedStars,
+        ulasan: ulasan.trim().slice(0, 300),
+      },
+      { onConflict: 'product_id,user_id' },
+    );
+
+    if (error) {
+      throw new Error(`Gagal menyimpan rating: ${error.message}`);
     }
+
+    await fetchRatings();
   };
 
   const deleteRating = async (ratingId: string) => {
-    const path = `ratings/${ratingId}`;
-    try {
-      await deleteDoc(doc(db, 'ratings', ratingId));
-    } catch (error) {
-      handleFirestoreError(error, OperationType.DELETE, path);
+    const { error } = await supabase
+      .from('ratings')
+      .delete()
+      .eq('id', ratingId);
+
+    if (error) {
+      throw new Error(`Gagal menghapus ulasan: ${error.message}`);
     }
+
+    await fetchRatings();
   };
 
   const isSeededInDb = dbProducts.length > 0;
@@ -220,6 +242,7 @@ export function MenuProvider({ children }: { children: React.ReactNode }) {
         submitRating,
         deleteRating,
         seedInitialMenu,
+        refreshMenu: fetchProducts,
       }}
     >
       {children}

@@ -20,7 +20,7 @@ export function HomePage() {
         const matchesQuery =
           !q ||
           item.nama_produk.toLowerCase().includes(q) ||
-          item.deskripsi.toLowerCase().includes(q);
+          (item.deskripsi || '').toLowerCase().includes(q);
         return matchesCat && matchesQuery;
       })
       .sort((a, b) => {

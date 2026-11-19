@@ -10,14 +10,13 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import { doc, serverTimestamp, writeBatch } from 'firebase/firestore';
 import { useAuth } from '../context/AuthContext.tsx';
 import { useCart } from '../context/CartContext.tsx';
 import { formatRupiah } from '../data/seedMenu.ts';
-import { db, handleFirestoreError, OperationType } from '../lib/firebase.ts';
+import { supabase } from '../lib/supabase.ts';
 
 export function CartDrawer() {
-  const { user, profile, openAuthModal, resendVerification } = useAuth();
+  const { user, profile, openAuthModal } = useAuth();
   const {
     items,
     isOpen,
@@ -30,7 +29,7 @@ export function CartDrawer() {
   } = useCart();
   const navigate = useNavigate();
 
-  const [namaPelanggan, setNamaPelanggan] = useState('');
+  const [namaPenerima, setNamaPenerima] = useState('');
   const [noHp, setNoHp] = useState('');
   const [alamat, setAlamat] = useState('');
   const [catatan, setCatatan] = useState('');
@@ -38,11 +37,10 @@ export function CartDrawer() {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
   const [successOrderId, setSuccessOrderId] = useState<string | null>(null);
-  const [verificationSent, setVerificationSent] = useState(false);
 
   useEffect(() => {
     if (profile) {
-      setNamaPelanggan((prev) => prev || profile.nama_lengkap || '');
+      setNamaPenerima((prev) => prev || profile.nama_lengkap || '');
       setNoHp((prev) => prev || profile.no_hp || '');
       setAlamat((prev) => prev || profile.alamat || '');
     }
@@ -60,70 +58,62 @@ export function CartDrawer() {
       return;
     }
 
-    if (!user.emailVerified) {
-      setError(
-        'Email Anda belum terverifikasi. Silakan klik tautan verifikasi di email Anda atau gunakan Google Sign-In.',
-      );
-      return;
-    }
-
     if (items.length === 0) {
       setError('Keranjang belanja masih kosong.');
       return;
     }
 
-    if (!namaPelanggan.trim() || !noHp.trim() || !alamat.trim()) {
+    if (!namaPenerima.trim() || !noHp.trim() || !alamat.trim()) {
       setError('Mohon lengkapi nama penerima, nomor HP, dan alamat pengiriman.');
       return;
     }
 
     setSubmitting(true);
-    const orderId = `ord_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    const ringkasan = items
-      .map((item) => `${item.qty}x ${item.product.nama_produk}`)
-      .join(', ')
-      .slice(0, 500);
 
     try {
-      const batch = writeBatch(db);
-      const orderRef = doc(db, 'orders', orderId);
+      const { data: createdOrder, error: orderError } = await supabase
+        .from('orders')
+        .insert({
+          user_id: user.id,
+          nama_penerima: namaPenerima.trim().slice(0, 120),
+          alamat_pengiriman: alamat.trim().slice(0, 300),
+          no_hp: noHp.trim().slice(0, 30),
+          total_harga: totalPrice,
+          status_pesanan: 'Menunggu Konfirmasi',
+          catatan: catatan.trim().slice(0, 400),
+        })
+        .select('id')
+        .single();
 
-      batch.set(orderRef, {
-        id: orderId,
-        user_id: user.uid,
-        nama_pelanggan: namaPelanggan.trim().slice(0, 120),
-        no_hp: noHp.trim().slice(0, 30),
-        alamat_pengiriman: alamat.trim().slice(0, 300),
-        total_harga: totalPrice,
-        jumlah_item: totalItems,
-        ringkasan_menu: ringkasan,
-        status_pesanan: 'Menunggu Konfirmasi',
-        catatan: catatan.trim().slice(0, 400),
-        created_at: serverTimestamp(),
-        updated_at: serverTimestamp(),
-      });
+      if (orderError || !createdOrder) {
+        throw new Error(orderError?.message || 'Gagal menyimpan data pesanan.');
+      }
 
-      items.forEach((item, index) => {
-        const itemId = `item_${index + 1}_${item.product.id.slice(0, 40)}`;
-        const itemRef = doc(db, 'orders', orderId, 'order_items', itemId);
-        batch.set(itemRef, {
-          id: itemId,
-          order_id: orderId,
-          user_id: user.uid,
-          product_id: item.product.id,
-          nama_produk: item.product.nama_produk.slice(0, 120),
-          harga_satuan: item.product.harga,
-          qty: item.qty,
-          subtotal: item.product.harga * item.qty,
-        });
-      });
+      const itemRows = items.map((item) => ({
+        order_id: createdOrder.id,
+        product_id: item.product.id,
+        nama_produk: item.product.nama_produk.slice(0, 120),
+        jumlah: item.qty,
+        harga_satuan: item.product.harga,
+      }));
 
-      await batch.commit();
+      const { error: itemsError } = await supabase
+        .from('order_items')
+        .insert(itemRows);
+
+      if (itemsError) {
+        throw new Error(itemsError.message);
+      }
+
       clearCart();
       setCatatan('');
-      setSuccessOrderId(orderId);
+      setSuccessOrderId(createdOrder.id);
     } catch (err) {
-      handleFirestoreError(err, OperationType.WRITE, `orders/${orderId}`);
+      setError(
+        err instanceof Error
+          ? `Gagal membuat pesanan: ${err.message}`
+          : 'Gagal membuat pesanan.',
+      );
     } finally {
       setSubmitting(false);
     }
@@ -277,7 +267,7 @@ export function CartDrawer() {
                 className="pt-4 border-t border-[#EAE3DA] space-y-3.5"
               >
                 <h3 className="text-sm font-bold text-[#1C1613]">
-                  Informasi Pengiriman & Catatan
+                  Informasi Pengiriman &amp; Catatan
                 </h3>
 
                 {!user && (
@@ -299,28 +289,6 @@ export function CartDrawer() {
                   </div>
                 )}
 
-                {user && !user.emailVerified && (
-                  <div className="p-3.5 rounded-xl bg-[#FFFBEB] border border-[#FDE68A] text-xs text-[#92400E] space-y-1.5">
-                    <p>
-                      Email Anda belum terverifikasi. Cek email Anda atau kirim
-                      ulang tautan verifikasi.
-                    </p>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        void resendVerification().then(() =>
-                          setVerificationSent(true),
-                        );
-                      }}
-                      className="font-semibold text-[#C82319] underline cursor-pointer"
-                    >
-                      {verificationSent
-                        ? 'Tautan verifikasi terkirim'
-                        : 'Kirim Ulang Email Verifikasi'}
-                    </button>
-                  </div>
-                )}
-
                 {error && (
                   <div className="flex items-start gap-2 p-3 rounded-xl bg-[#FEF2F2] border border-[#FECACA] text-[#991B1B] text-xs">
                     <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
@@ -338,9 +306,9 @@ export function CartDrawer() {
                   <input
                     id="checkout-name"
                     type="text"
-                    value={namaPelanggan}
-                    onChange={(e) => setNamaPelanggan(e.target.value)}
-                    placeholder="Nama lengkap Anda"
+                    value={namaPenerima}
+                    onChange={(e) => setNamaPenerima(e.target.value)}
+                    placeholder="Nama lengkap penerima"
                     className="w-full px-3.5 py-2.5 rounded-lg border border-[#DDD2C5] text-sm focus:outline-none focus:ring-2 focus:ring-[#C82319]"
                     required
                   />

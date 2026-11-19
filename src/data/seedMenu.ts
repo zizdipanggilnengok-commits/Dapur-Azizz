@@ -36,9 +36,40 @@ export const IMAGE_PRESETS = [
     label: 'Teh Panas / Tawar',
     url: '/src/assets/images/menu_teh_panas_1794986396344.jpg',
   },
+  {
+    label: 'Es Extrajoss',
+    url: '/src/assets/images/menu_es_extrajoss_1795053934024.jpg',
+  },
+  {
+    label: 'Es Kukubima',
+    url: '/src/assets/images/menu_es_kukubima_1795053933267.jpg',
+  },
 ];
 
-export const SEED_MENU_ITEMS: Omit<Product, 'created_at' | 'updated_at'>[] = [
+const PRODUCT_IMAGE_FALLBACKS: Record<string, string> = {
+  'lalapan ayam goreng': '/src/assets/images/menu_ayam_goreng_1794986393478.jpg',
+  'lalapan lele goreng': '/src/assets/images/menu_lele_goreng_1794986393149.jpg',
+  'lalapan bebek goreng': '/src/assets/images/menu_bebek_goreng_1794986395153.jpg',
+  'lalapan tempe & tahu penyet': '/src/assets/images/menu_tempe_tahu_1794986394692.jpg',
+  'es teh': '/src/assets/images/menu_es_teh_1794986395862.jpg',
+  'es jeruk': '/src/assets/images/menu_es_jeruk_1794986395415.jpg',
+  'es milo': '/src/assets/images/menu_es_milo_1794986396587.jpg',
+  'teh panas': '/src/assets/images/menu_teh_panas_1794986396344.jpg',
+  'teh tawar': '/src/assets/images/menu_teh_panas_1794986396344.jpg',
+  'es extrajoss': '/src/assets/images/menu_es_extrajoss_1795053934024.jpg',
+  'es kukubima': '/src/assets/images/menu_es_kukubima_1795053933267.jpg',
+};
+
+export function resolveProductImage(
+  product: Pick<Product, 'nama_produk' | 'gambar_url'>,
+): string | null {
+  const raw = product.gambar_url?.trim();
+  if (raw) return raw;
+  const key = product.nama_produk.trim().toLowerCase();
+  return PRODUCT_IMAGE_FALLBACKS[key] ?? null;
+}
+
+export const SEED_MENU_ITEMS: Omit<Product, 'created_at'>[] = [
   {
     id: 'lalapan-ayam-goreng',
     nama_produk: 'Lalapan Ayam Goreng',

@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { CheckCircle2, Loader2, User as UserIcon } from 'lucide-react';
+import { AlertCircle, CheckCircle2, Loader2, User as UserIcon } from 'lucide-react';
 import { useAuth } from '../context/AuthContext.tsx';
 
 export function ProfilePage() {
@@ -9,6 +9,7 @@ export function ProfilePage() {
   const [alamat, setAlamat] = useState('');
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [error, setError] = useState('');
 
   useEffect(() => {
     if (profile) {
@@ -43,6 +44,7 @@ export function ProfilePage() {
     e.preventDefault();
     setSaving(true);
     setSaved(false);
+    setError('');
     try {
       await updateMyProfile({
         nama_lengkap: namaLengkap,
@@ -50,6 +52,10 @@ export function ProfilePage() {
         alamat,
       });
       setSaved(true);
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : 'Gagal memperbarui profil.',
+      );
     } finally {
       setSaving(false);
     }
@@ -135,6 +141,13 @@ export function ProfilePage() {
             className="w-full px-3.5 py-2.5 rounded-lg border border-[#DDD2C5] text-sm focus:outline-none focus:ring-2 focus:ring-[#C82319]"
           />
         </div>
+
+        {error && (
+          <div className="flex items-center gap-2 p-3 rounded-xl bg-[#FEF2F2] border border-[#FECACA] text-[#991B1B] text-xs font-medium">
+            <AlertCircle className="w-4 h-4 shrink-0" />
+            <span>{error}</span>
+          </div>
+        )}
 
         {saved && (
           <div className="flex items-center gap-2 p-3 rounded-xl bg-[#ECFDF5] border border-[#A7F3D0] text-[#065F46] text-xs font-medium">
